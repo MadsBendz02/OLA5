@@ -82,3 +82,63 @@ variable_today_status <- variable_today %>%
 # nu har du:
 # - På lager / Solgt / Smidt ud for varer, der fandtes i går
 # - nye varer fra i dag med status = NA (men de kommer stadig i SQL)
+
+stamdata_db <- stamdata %>%
+  dplyr::rename(
+    store_id             = store.id,
+    store_brand          = store.brand,
+    store_name           = store.name,
+    store_address_street = store.address.street
+  )
+
+offer_variable_db <- variable_today_status %>%
+  dplyr::rename(
+    store_id              = store.id,
+    offer_ean             = offer.ean,
+    offer_startTime       = offer.startTime,
+    offer_endTime         = offer.endTime,
+    offer_newPrice        = offer.newPrice,
+    offer_originalPrice   = offer.originalPrice,
+    offer_percentDiscount = offer.percentDiscount,
+    offer_discount        = offer.discount,
+    offer_lastUpdate      = offer.lastUpdate,
+    product_ean           = product.ean,
+    product_description   = product.description,
+    product_categories_da = product.categories.da
+  )
+
+# --------------------------------------------------
+# 6) Skriv til MySQL på Ubuntu
+# --------------------------------------------------
+
+con <- dbConnect(
+  MariaDB(),
+  dbname   = "foodwaste",   # dit DB-navn
+  host     = "localhost", # på EC2 typisk localhost
+  user     = "root",      # dit DB-brugernavn
+  password = "Timmtimm2002!"   # din adgangskode
+)
+
+## 6.1) Stamdata – kan bare truncates og indsættes igen
+dbExecute(con, "TRUNCATE TABLE store_static;")
+
+dbWriteTable(
+  con,
+  "store_static",
+  stamdata_db,
+  append    = TRUE,
+  row.names = FALSE
+)
+
+## 6.2) Variable – APPEND-ONLY (historisk tidsserie)
+dbWriteTable(
+  con,
+  "offer_variable",
+  offer_variable_db,
+  append    = TRUE,
+  row.names = FALSE
+)
+
+dbDisconnect(con)
+
+cat("Status beregnet og data skrevet til MySQL.\n")
