@@ -1,15 +1,27 @@
-CREATE TABLE `store` (
-  `Venue` varchar(255) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin DEFAULT NULL,
-  `ID` varchar(255) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin NOT NULL,
-  `KmPL` float DEFAULT NULL,
-  `Caryear` int NOT NULL,
-  `Color` varchar(45) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin DEFAULT NULL,
-  `Cardescription` diumtext CHARACTER SET utf8mb3 COLLATE utf8mb3_bin,
-  `Image` varchar(45) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin DEFAULT NULL,
-  `Store_id` int NOT NULL,
-  `Price_id` int DEFAULT NULL,
-  `Region` varchar(45) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin DEFAULT NULL,
-  `Seller_id` int DEFAULT NULL,
-  `kmstand` int DEFAULT NULL,
-  PRIMARY KEY (`Store_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_bin
+CREATE TABLE store_static (
+  store_id             INT PRIMARY KEY,
+  store_brand          VARCHAR(50),
+  store_name           VARCHAR(255),
+  store_address_street VARCHAR(255),
+  postnummer           VARCHAR(10)
+);
+
+CREATE TABLE offer_variable (
+  store_id              INT,
+  offer_ean             VARCHAR(50),
+  offer_startTime       DATETIME,
+  offer_endTime         DATETIME,
+  offer_newPrice        DECIMAL(10,2),
+  offer_originalPrice   DECIMAL(10,2),
+  offer_percentDiscount DECIMAL(5,2),
+  offer_discount        DECIMAL(10,2),
+  offer_lastUpdate      DATETIME,
+  offer_stock           INT,
+  product_ean           VARCHAR(50),
+  product_description   TEXT,
+  product_categories_da TEXT,
+  timestamp_pipeline    DATETIME,
+  snapshot_date         DATE,
+  status                VARCHAR(20),
+  PRIMARY KEY (store_id, offer_ean, offer_startTime, snapshot_date)
+);
