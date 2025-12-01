@@ -3,16 +3,15 @@ library(jsonlite)
 library(tidyverse)
 library(dplyr)
 library(lubridate)
-library(DBI)
-library(RMariaDB)  # først når du er klar til at skrive til MySQL
 
 api_key <- Sys.getenv("SALLING_API_KEY")
 run_timestamp <- Sys.time()
 logfile       <- "foodwaste_log.txt"
 
-### FOOD ###
+### 1) POSTNUMRE ###
 postnumre <- c("3520", "7080", "1264", "1560")
 
+### 2) HENT-FUNKTION ###
 hent_foodwaste <- function(postnummer) {
   foodurl <- "https://api.sallinggroup.com/v1/food-waste"
   
@@ -32,26 +31,58 @@ hent_foodwaste <- function(postnummer) {
   fooddf
 }
 
+### 3) HENT ALLE BUTIKKER (food_all) ###
+food_list <- lapply(postnumre, hent_foodwaste)
+food_all  <- do.call(rbind, food_list)
 
-# 1) vælg kun rækker hvor clearances er et data.frame med mindst 1 række
-valid_rows <- sapply(food_all$clearances, function(x) is.data.frame(x) && nrow(x) > 0)
+# TJEK:
+# View(food_all)
+# str(food_all$clearances)
+
+### 4) FILTER BUTIKKER MED RIGTIGE CLEARANCES + UNNEST ###
+
+# vælg kun rækker hvor clearances er et data.frame med mindst 1 række
+valid_rows <- sapply(
+  food_all$clearances,
+  function(x) is.data.frame(x) && nrow(x) > 0
+)
 
 food_all_nonempty <- food_all[valid_rows, ]
 
-# 2) unnest kun på de rækker
 offers_all <- food_all_nonempty %>%
-  unnest(clearances) %>%
-  mutate(timestamp_pipeline = run_timestamp)
+  tidyr::unnest(clearances) %>%   # folder alle ikke-tomme clearances ud
+  mutate(
+    timestamp_pipeline = run_timestamp
+  )
 
+# TJEK:
+# View(offers_all)
+# nrow(offers_all)
+
+### 5) STAMDATA FRA food_all (ALLE BUTIKKER) ###
 
 stamdata <- food_all %>%
-  distinct(
+  select(
     store.id,
     store.brand,
     store.name,
     store.address.street,
     postnummer
+  ) %>%
+  distinct()
+
+stamdata <- stamdata %>%
+  rename(
+    store_id             = store.id,
+    store_brand          = store.brand,
+    store_name           = store.name,
+    store_address_street = store.address.street
+    # postnummer er OK
   )
+
+# View(stamdata)
+
+### 6) VARIABLE FRA offers_all (ALLE TILBUD) ###
 
 variable <- offers_all %>%
   select(
@@ -71,22 +102,62 @@ variable <- offers_all %>%
     timestamp_pipeline
   )
 
+variable <- variable %>%
+  mutate(snapshot_date = as.Date(timestamp_pipeline)) %>%
+  rename(
+    store_id              = store.id,
+    offer_ean             = offer.ean,
+    offer_startTime       = offer.startTime,
+    offer_endTime         = offer.endTime,
+    offer_newPrice        = offer.newPrice,
+    offer_originalPrice   = offer.originalPrice,
+    offer_percentDiscount = offer.percentDiscount,
+    offer_discount        = offer.discount,
+    offer_lastUpdate      = offer.lastUpdate,
+    offer_stock           = offer.stock,
+    product_ean           = product.ean,
+    product_description   = product.description,
+    product_categories_da = product.categories.da
+  )
+
+
+
+library(DBI)
+library(RMariaDB)
+
 con <- dbConnect(
   MariaDB(),
-  dbname   = "foodwaste",    # din DB
-  host     = "localhost",  # på EC2
-  user     = "root",       # dit brugernavn
-  password = "Timmtimm2002!"    # skift til din rigtige kode
+  user = "root",          # eller den bruger du lavede
+  password = "Timmtimm2002!",
+  dbname = "foodwaste",
+  host = "localhost"
 )
 
-# Stamdata: overskriv hele tabellen hver gang
-dbExecute(con, "TRUNCATE TABLE store_static;")
-dbWriteTable(con, "store_static", stamdata, append = TRUE, row.names = FALSE)
+rows_in_store <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM store_static")$n
 
-# Variable: APPEND – så hver scrape giver nye rækker med nyt timestamp_pipeline
-dbWriteTable(con, "offer_variable", variable, append = TRUE, row.names = FALSE)
+if (rows_in_store == 0) {
+  cat("Uploader stores første gang...\n")
+  
+  dbWriteTable(
+    con,
+    name = "store_static",
+    value = stamdata,
+    append = TRUE,
+    row.names = FALSE
+  )
+  
+} else {
+  cat("Springer upload af stores over – de findes allerede.\n")
+}
+
+dbWriteTable(
+  con,
+  name = "offer_variable",
+  value = variable,
+  append = TRUE,
+  row.names = FALSE
+)
 
 dbDisconnect(con)
 
-cat("Scrape gemt i MySQL.\n")
 
