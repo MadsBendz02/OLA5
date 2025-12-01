@@ -1,65 +1,89 @@
+###############################################
+### FOODWASTE PIPELINE – ENDVERSION          ###
+### Robust til SQL + API fejlhåndtering      ###
+###############################################
+
 library(httr)
 library(jsonlite)
 library(tidyverse)
-library(dplyr)
 library(lubridate)
+library(DBI)
+library(RMariaDB)
 
 api_key <- Sys.getenv("SALLING_API_KEY")
 run_timestamp <- Sys.time()
-logfile       <- "foodwaste_log.txt"
 
 ### 1) POSTNUMRE ###
 postnumre <- c("3520", "7080", "1264", "1560")
 
-### 2) HENT-FUNKTION ###
+########################################################
+### 2) ROBUST API-FUNKTION (HÅNDTERER 400 / 500)      ###
+########################################################
+
 hent_foodwaste <- function(postnummer) {
-  foodurl <- "https://api.sallinggroup.com/v1/food-waste"
+  url <- "https://api.sallinggroup.com/v1/food-waste"
   
-  foodres <- GET(
-    url   = foodurl,
+  res <- GET(
+    url,
     query = list(zip = postnummer),
     add_headers(Authorization = paste("Bearer", api_key))
   )
   
-  stop_for_status(foodres)
+  sc <- status_code(res)
   
-  food_json   <- content(foodres, as = "text", encoding = "UTF-8")
-  foodparsed  <- fromJSON(food_json, flatten = TRUE)
-  fooddf      <- as.data.frame(foodparsed)
-  fooddf$postnummer <- postnummer
+  # 200 OK → Parse
+  if (sc == 200) {
+    txt <- content(res, as = "text", encoding = "UTF-8")
+    
+    if (txt == "" || txt == "null") {
+      cat("Tom response ved ZIP:", postnummer, "\n")
+      return(NULL)
+    }
+    
+    parsed <- fromJSON(txt, flatten = TRUE)
+    df <- as.data.frame(parsed)
+    df$postnummer <- postnummer
+    return(df)
+  }
   
-  fooddf
+  # 4xx fejl → stop (critcal)
+  if (sc >= 400 && sc < 500) {
+    stop(paste("Fatal API fejl ved ZIP", postnummer, "status", sc,
+               "- sandsynligvis ugyldig API-nøgle eller request."))
+  }
+  
+  # 5xx fejl → skip
+  if (sc >= 500) {
+    cat("Serverfejl 500 ved ZIP", postnummer, "– springer over.\n")
+    return(NULL)
+  }
 }
 
-### 3) HENT ALLE BUTIKKER (food_all) ###
+########################################################
+### 3) HENT BUTIKKER                                   ###
+########################################################
+
 food_list <- lapply(postnumre, hent_foodwaste)
+food_list <- Filter(Negate(is.null), food_list)   # fjern NULL
 food_all  <- do.call(rbind, food_list)
 
-# TJEK:
-# View(food_all)
-# str(food_all$clearances)
+########################################################
+### 4) UNNEST + FILTER CLEARANCES                     ###
+########################################################
 
-### 4) FILTER BUTIKKER MED RIGTIGE CLEARANCES + UNNEST ###
+valid <- sapply(food_all$clearances, function(x) {
+  is.data.frame(x) && nrow(x) > 0
+})
 
-# vælg kun rækker hvor clearances er et data.frame med mindst 1 række
-valid_rows <- sapply(
-  food_all$clearances,
-  function(x) is.data.frame(x) && nrow(x) > 0
-)
-
-food_all_nonempty <- food_all[valid_rows, ]
+food_all_nonempty <- food_all[valid, ]
 
 offers_all <- food_all_nonempty %>%
-  tidyr::unnest(clearances) %>%   # folder alle ikke-tomme clearances ud
-  mutate(
-    timestamp_pipeline = run_timestamp
-  )
+  tidyr::unnest(clearances) %>%
+  mutate(timestamp_pipeline = run_timestamp)
 
-# TJEK:
-# View(offers_all)
-# nrow(offers_all)
-
-### 5) STAMDATA FRA food_all (ALLE BUTIKKER) ###
+########################################################
+### 5) STAMDATA                                        ###
+########################################################
 
 stamdata <- food_all %>%
   select(
@@ -69,20 +93,18 @@ stamdata <- food_all %>%
     store.address.street,
     postnummer
   ) %>%
-  distinct()
-
-stamdata <- stamdata %>%
+  distinct() %>%
   rename(
-    store_id             = store.id,
-    store_brand          = store.brand,
-    store_name           = store.name,
-    store_address_street = store.address.street
-    # postnummer er OK
+    store_id              = store.id,
+    store_brand           = store.brand,
+    store_name            = store.name,
+    store_address_street  = store.address.street
   )
 
-# View(stamdata)
 
-### 6) VARIABLE FRA offers_all (ALLE TILBUD) ###
+########################################################
+### 6) VARIABLE (TILBUD) + DATO-KONVERTERING           ###
+########################################################
 
 variable <- offers_all %>%
   select(
@@ -100,10 +122,13 @@ variable <- offers_all %>%
     product.description,
     product.categories.da,
     timestamp_pipeline
-  )
-
-variable <- variable %>%
-  mutate(snapshot_date = as.Date(timestamp_pipeline)) %>%
+  ) %>%
+  mutate(
+    offer.startTime = ymd_hms(offer.startTime, tz = "UTC"),
+    offer.endTime   = ymd_hms(offer.endTime,   tz = "UTC"),
+    offer.lastUpdate = ymd_hms(offer.lastUpdate, tz = "UTC"),
+    snapshot_date = as.Date(timestamp_pipeline)
+  ) %>%
   rename(
     store_id              = store.id,
     offer_ean             = offer.ean,
@@ -120,44 +145,38 @@ variable <- variable %>%
     product_categories_da = product.categories.da
   )
 
-
-
-library(DBI)
-library(RMariaDB)
+########################################################
+### 7) SQL FORBINDELSE                                ###
+########################################################
 
 con <- dbConnect(
   MariaDB(),
-  user = "root",          # eller den bruger du lavede
+  user = "root",
   password = "Timmtimm2002!",
   dbname = "foodwaste",
   host = "localhost"
 )
 
-rows_in_store <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM store_static")$n
+########################################################
+### 8) UPLOAD STAMDATA (KUN FØRSTE GANG)              ###
+########################################################
 
-if (rows_in_store == 0) {
+rows <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM store_static")$n
+
+if (rows == 0) {
   cat("Uploader stores første gang...\n")
-  
-  dbWriteTable(
-    con,
-    name = "store_static",
-    value = stamdata,
-    append = TRUE,
-    row.names = FALSE
-  )
-  
+  dbWriteTable(con, "store_static", stamdata, append = TRUE, row.names = FALSE)
 } else {
-  cat("Springer upload af stores over – de findes allerede.\n")
+  cat("Springer upload af stores over – findes allerede.\n")
 }
 
-dbWriteTable(
-  con,
-  name = "offer_variable",
-  value = variable,
-  append = TRUE,
-  row.names = FALSE
-)
+########################################################
+### 9) UPLOAD OFFERS (HVER GANG)                      ###
+########################################################
+
+dbWriteTable(con, "offer_variable", variable, append = TRUE, row.names = FALSE)
 
 dbDisconnect(con)
 
-
+cat("\n--- FOODWASTE PIPELINE KØRT FÆRDIGT ---\n")
+cat("Timestamp:", run_timestamp, "\n")
