@@ -1,39 +1,45 @@
 library(dplyr)
 library(lubridate)
+library(DBI)
+library(RMariaDB)
 
-# antag: variable_all har ALLE kørsler appender efterhånden
-# og indeholder mindst:
-# store.id, offer.ean, offer.startTime, offer.endTime, timestamp_pipeline
 
-variable <- variable %>%
+# Sikkerhedstjek (stop hvis hentdata ikke er kørt endnu)
+if (!file.exists("variable_all.rds")) {
+  stop("FEJL: variable_all.rds findes ikke. Kør foodwaste_hentdata.r først.")
+}
+
+if (!file.exists("stamdata.rds")) {
+  stop("FEJL: stamdata.rds findes ikke. Kør foodwaste_hentdata.r først.")
+}
+
+# LÆS RDS-FILERNE (DETTE MANGLER I DIN KODE)
+variable_all <- readRDS("variable_all.rds")
+stamdata     <- readRDS("stamdata.rds")
+
+# Tilføj snapshot_date og expiry_date
+variable <- variable_all %>%
   mutate(
     snapshot_date = as.Date(timestamp_pipeline),
     expiry_date   = as.Date(offer.endTime)
   )
 
-# find de 2 seneste datoer vi har scraped
+# Find i går og i dag
 dates <- sort(unique(variable$snapshot_date))
 
 if (length(dates) < 2) {
-  stop("Har kun én scraping-dag lige nu – kan ikke afgøre solgt/smidt ud endnu.")
+  stop("Der er kun én scraping-dag i historikken. Kan ikke beregne status endnu.")
 }
 
 yesterday <- dates[length(dates) - 1]
 today     <- dates[length(dates)]
 
-cat("Bruger disse dage til sammenligning:\n",
-    "I går: ", yesterday, "\n",
-    "I dag: ", today, "\n")
-
-# nøgle til at identificere et unikt tilbud
 key_cols <- c("store.id", "offer.ean", "offer.startTime")
 
-# data for i går og i dag
 offers_y <- filter(variable, snapshot_date == yesterday)
 offers_t <- filter(variable, snapshot_date == today)
 
-## 1) På lager: fandtes både i går og i dag ------------------------------
-
+# 1: På lager (findes i dag og i går)
 on_stock <- inner_join(
   offers_y[, c(key_cols, "expiry_date")],
   offers_t[, key_cols],
@@ -42,11 +48,10 @@ on_stock <- inner_join(
   distinct(store.id, offer.ean, offer.startTime, .keep_all = TRUE) %>%
   mutate(
     snapshot_date = today,
-    status        = "På lager"
+    status = "På lager"
   )
 
-## 2) Forsvundet siden i går: enten Solgt eller Smidt ud -----------------
-
+# 2: Forsvundet (var i går men ikke i dag)
 disappeared <- anti_join(
   offers_y[, c(key_cols, "expiry_date")],
   offers_t[, key_cols],
@@ -56,88 +61,41 @@ disappeared <- anti_join(
     snapshot_date = today,
     status = if_else(
       expiry_date == today,
-      "Smidt ud",   # var i går, væk i dag, udløber i dag
-      "Solgt"       # var i går, væk i dag, udløber IKKE i dag
+      "Smidt ud",
+      "Solgt"
     )
   )
 
-## 3) Samlet status for de varer, der fandtes i går ----------------------
-
+# 3: Samlet status
 offers_status <- bind_rows(on_stock, disappeared)
 
-## 4) Join status på dagens variable-data -------------------------------
+# 4: Join status på dagens variable
+variable_today <- filter(variable, snapshot_date == today)
 
-# Alle observationer i dag (inkl. nye varer)
-variable_today <- variable %>%
-  filter(snapshot_date == today)
-
-# Join status på – nye varer får NA i status
 variable_today_status <- variable_today %>%
   left_join(
-    offers_status %>%
-      select(store.id, offer.ean, offer.startTime, snapshot_date, status),
+    offers_status %>% select(store.id, offer.ean, offer.startTime, snapshot_date, status),
     by = c("store.id", "offer.ean", "offer.startTime", "snapshot_date")
   )
 
-# nu har du:
-# - På lager / Solgt / Smidt ud for varer, der fandtes i går
-# - nye varer fra i dag med status = NA (men de kommer stadig i SQL)
-
-stamdata_db <- stamdata %>%
-  dplyr::rename(
-    store_id             = store.id,
-    store_brand          = store.brand,
-    store_name           = store.name,
-    store_address_street = store.address.street
-  )
-
-offer_variable_db <- variable_today_status %>%
-  dplyr::rename(
-    store_id              = store.id,
-    offer_ean             = offer.ean,
-    offer_startTime       = offer.startTime,
-    offer_endTime         = offer.endTime,
-    offer_newPrice        = offer.newPrice,
-    offer_originalPrice   = offer.originalPrice,
-    offer_percentDiscount = offer.percentDiscount,
-    offer_discount        = offer.discount,
-    offer_lastUpdate      = offer.lastUpdate,
-    product_ean           = product.ean,
-    product_description   = product.description,
-    product_categories_da = product.categories.da
-  )
-
-# --------------------------------------------------
-# 6) Skriv til MySQL på Ubuntu
-# --------------------------------------------------
+# --------------------------
+# SKRIV TIL MYSQL DATABASE
+# --------------------------
 
 con <- dbConnect(
   MariaDB(),
-  dbname   = "foodwaste",   # dit DB-navn
-  host     = "localhost", # på EC2 typisk localhost
-  user     = "root",      # dit DB-brugernavn
-  password = "Timmtimm2002!"   # din adgangskode
+  dbname   = "foodwaste",
+  host     = "localhost",
+  user     = "root",
+  password = "Timmtimm2002!"
 )
 
-## 6.1) Stamdata – kan bare truncates og indsættes igen
+# Stamdata: overskriv hele tabellen
 dbExecute(con, "TRUNCATE TABLE store_static;")
+dbWriteTable(con, "store_static", stamdata, append = TRUE, row.names = FALSE)
 
-dbWriteTable(
-  con,
-  "store_static",
-  stamdata_db,
-  append    = TRUE,
-  row.names = FALSE
-)
-
-## 6.2) Variable – APPEND-ONLY (historisk tidsserie)
-dbWriteTable(
-  con,
-  "offer_variable",
-  offer_variable_db,
-  append    = TRUE,
-  row.names = FALSE
-)
+# Variable: append dagens data (historik i SQL)
+dbWriteTable(con, "offer_variable", variable_today_status, append = TRUE, row.names = FALSE)
 
 dbDisconnect(con)
 

@@ -145,3 +145,22 @@ variable <- allebutikker[, c(
   "timestamp_pipeline"
 )]
 
+# Byg / opdater historikken med alle scrapes ------------------------
+
+
+if (file.exists("variable_all.rds")) {
+  variable_all_old <- readRDS("variable_all.rds")
+  variable_all <- dplyr::bind_rows(variable_all_old, variable)
+} else {
+  variable_all <- variable
+}
+
+# Gem opdateret historik
+saveRDS(variable_all, "variable_all.rds")
+
+# Gem også stamdata til status-scriptet
+saveRDS(stamdata, "stamdata.rds")
+
+cat("Hentdata kørt og historik opdateret.\n")
+
+
